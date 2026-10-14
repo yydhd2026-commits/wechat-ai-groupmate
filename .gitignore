@@ -1,0 +1,73 @@
+# ============ 隐私:绝对不要提交 ============
+# 真实配置(含账号、群名、可能含 Key)
+config.json
+config.local.json
+
+# 密钥文件
+*.key
+*.pem
+.env
+.env.*
+
+# ============ 运行时数据 ============
+# 长期记忆(含聊天内容提炼出的事实 —— 属于隐私!)
+memory.json
+memory.json.bak
+bot_state.json
+
+# 日志
+*.log
+bot.log*
+
+# 媒体缓存(图片/语音原件 —— 属于隐私!)
+_images/
+_voices/
+_downloads/
+_asr_cache/
+
+# 紧急停止开关
+STOP
+
+# ============ Python ============
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+
+# 测试与覆盖率
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ============ 编辑器 / 系统 ============
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ============ 临时文件 ============
+tmp*/
+*.tmp
+*.bak
+
+# ============ 截图 / 调试产物 ============
+*.png
+*.jpg
+!docs/**/*.png
+!docs/**/*.jpg

@@ -1,0 +1,92 @@
+{
+  "_说明": "复制本文件为 config.json 后按注释修改。config.json 已被 .gitignore 忽略,不会上传。",
+
+  "dry_run": true,
+
+  "wechat_account": "",
+
+  "log_file": "bot.log",
+
+  "learn_every_messages": 25,
+
+  "trigger": {
+    "_说明": "群白名单 + 触发方式",
+    "groups": ["把这里改成你的群名"],
+    "mention_names": ["小助手"],
+    "keywords": [],
+    "quiet_hours": [1, 7],
+    "max_reply_chars": 600,
+    "reply_prefix": "",
+
+    "image_wait_seconds": 3,
+    "image_follow_seconds": 90,
+    "image_lookback_seconds": 600,
+    "proactive_enabled": true,
+    "proactive_cooldown_seconds": 20,
+    "post_send_cooldown_seconds": 8,
+    "mention_debounce_seconds": 0,
+    "self_silence_seconds": 1,
+    "per_user_cooldown_seconds": 3,
+    "per_group_cooldown_seconds": 1,
+    "random_reply_probability": 0.0
+  },
+
+  "guard": {
+    "_说明": "硬护栏:防止刷屏和被封",
+    "max_per_minute": 12,
+    "max_per_hour": 150,
+    "max_per_day": 800,
+    "max_consecutive_failures": 5,
+    "kill_switch_file": "STOP"
+  },
+
+  "llm": {
+    "_说明": "大模型。DeepSeek 官方接口即可。",
+    "base_url": "https://api.deepseek.com/v1",
+    "model": "deepseek-chat",
+    "api_key": "",
+    "api_key_env": "DEEPSEEK_API_KEY",
+    "temperature": 1.3,
+    "max_tokens": 1200,
+    "timeout_seconds": 90,
+    "history_limit": 30
+  },
+
+  "voice": {
+    "_说明": "语音识别。任何 OpenAI 兼容的 /audio/transcriptions 接口都能用。SiliconFlow 有免费额度。",
+    "enabled": true,
+    "base_url": "https://api.siliconflow.cn/v1",
+    "model": "FunAudioLLM/SenseVoiceSmall",
+    "api_key": "",
+    "api_key_env": "ASR_API_KEY",
+    "language": "zh",
+    "timeout_seconds": 60,
+    "max_seconds": 120,
+    "tell_when_unavailable": true
+  },
+
+  "persona": {
+    "_说明": "人设。七字段结构来自 PersonaMorph 的实测结论:写清动机才演得出人。留空的字段会自动跳过。",
+    "name": "小助手",
+
+    "background": "一个普通高中生,跟群里这些人同校同班,平时上课、写作业、打游戏、刷视频。",
+
+    "personality": "随和、爱开玩笑、有点贫,但不招人烦;别人认真问事的时候会正经答。",
+
+    "language_style": "说话短,像微信里随手打的。网络热梗张口就来,会用「emmm」「啊这」「乐」「绷」这类口头语。表情很省:大多数话不加,偶尔为了接梗带一个。不端着,不打官腔。",
+
+    "motivation": "想在群里混得开,被当成一个真人而不是机器人;喜欢接梗,也喜欢在别人卡住的时候搭把手。",
+
+    "values": "不装、不端着;答应的事会做到;不懂就说不懂,不瞎编。",
+
+    "behavior_rules": "被 @ 了一定回。别人连着问就接着答,不要装死。一次只说一件事,别发小作文。不主动挑事、不站队。",
+
+    "limitations": "看不到别人手机里的东西;不知道群里没聊过的事;会认错字,也会算错数。",
+
+    "examples": [
+      {"user": "@小助手 这题怎么做", "bot": "拍清楚点,这图糊得我看不清题号[捂脸]"},
+      {"user": "@小助手 1加1等于几", "bot": "2啊，这还用问"},
+      {"user": "@小助手 你觉得我帅吗", "bot": "帅,群里第二帅,第一是我[旺柴]"}
+    ]
+  }
+}

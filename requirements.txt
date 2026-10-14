@@ -1,0 +1,21 @@
+# 依赖清单
+#
+# 安装:
+#     pip install -r requirements.txt
+#
+# 注意:wechatauto-replica 是核心依赖(微信读写通道),由第三方发布在 PyPI。
+#       本项目只调用它的公开 API,不包含也不修改它的代码。
+
+# ---- 微信读写通道(核心)----
+wechatauto-replica>=1.2.4
+
+# ---- UI 自动化(发送消息、点击界面)----
+uiautomation>=2.0.18
+comtypes>=1.2.0
+
+# ---- 图片处理(视觉识别:把图压缩后发给多模态模型)----
+pillow>=10.0.0
+
+# ---- 语音解码:微信语音是 SILK 格式,需要解码成 WAV ----
+# silk-python 提供预编译的 pysilk 扩展,Windows 上不必装 C 编译器。
+silk-python>=0.2.8
