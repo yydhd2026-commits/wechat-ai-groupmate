@@ -128,7 +128,7 @@ class ReplyPolicy:
             self._mark_mention(msg)
             return True, "mention"
         # ⚠ 用带边界的匹配,不能用 "@名字" in text 的纯子串:
-        #   否则 "@Ngyydhdhd"(别人昵称以机器人名开头) 会被误唤醒。
+        #   否则 "@小助手bot"(别人昵称以机器人名开头) 会被误唤醒。
         if is_at_me(probe, t.mention_names):
             self._mark_mention(msg)
             return True, "mention"

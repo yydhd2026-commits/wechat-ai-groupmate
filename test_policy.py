@@ -404,17 +404,17 @@ def test_prompt():
 
 def test_strip_mention():
     print("\n[14] @ 前缀剥离(只把问题本身交给 AI)")
-    check("普通 @", strip_mention("@Ngyydhd 今天天气怎么样") == "今天天气怎么样",
-          repr(strip_mention("@Ngyydhd 今天天气怎么样")))
+    check("普通 @", strip_mention("@小助手 今天天气怎么样") == "今天天气怎么样",
+          repr(strip_mention("@小助手 今天天气怎么样")))
     check("带占位符的 @(微信真实格式)",
-          strip_mention("@Ngyydhd\u2005今天天气怎么样") == "今天天气怎么样")
+          strip_mention("@小助手\u2005今天天气怎么样") == "今天天气怎么样")
     check("多处占位符",
-          strip_mention("@Ngyydhd\u2005你好\u2005在吗") == "你好 在吗")
+          strip_mention("@小助手\u2005你好\u2005在吗") == "你好 在吗")
     check("别的名字", strip_mention("@小助手 帮我算个题") == "帮我算个题")
-    check("只有 @ 没有内容", strip_mention("@Ngyydhd") == "")
-    check("只有 @ 加空格", strip_mention("@Ngyydhd ") == "")
+    check("只有 @ 没有内容", strip_mention("@小助手") == "")
+    check("只有 @ 加空格", strip_mention("@小助手 ") == "")
     check("没有 @ 时原样返回", strip_mention("今天天气怎么样") == "今天天气怎么样")
-    check("多空格折叠", strip_mention("@Ngyydhd  多个   空格") == "多个 空格")
+    check("多空格折叠", strip_mention("@小助手  多个   空格") == "多个 空格")
     check("空输入", strip_mention("") == "")
     check("None 输入", strip_mention(None) == "")
 
@@ -589,7 +589,7 @@ def test_image_follow():
     p = ReplyPolicy(cfg, now_fn=clock, rand=lambda: 0.99)
 
     # 先 @ 一下
-    m1 = msg("@Ngyydhd", sender="张三", t=clock.t, mentioned=True, msg_id="f1")
+    m1 = msg("@小助手", sender="张三", t=clock.t, mentioned=True, msg_id="f1")
     d1 = p.decide(m1)
     check("先 @ 能触发", d1.reply and d1.trigger == "mention", d1.reason)
     p.record_reply(m1, clock.t)
@@ -604,7 +604,7 @@ def test_image_follow():
 
     # 别人的图不该触发(不是刚 @ 我的那个人)
     p2 = ReplyPolicy(cfg, now_fn=clock, rand=lambda: 0.99)
-    m2 = msg("@Ngyydhd", sender="张三", t=clock.t, mentioned=True, msg_id="g1")
+    m2 = msg("@小助手", sender="张三", t=clock.t, mentioned=True, msg_id="g1")
     p2.decide(m2)
     p2.record_reply(m2, clock.t)
     other_img = msg("", sender="李四", t=clock.t + 5, msg_id="g2")
@@ -614,7 +614,7 @@ def test_image_follow():
 
     # 超过时间窗的图不触发
     p3 = ReplyPolicy(cfg, now_fn=clock, rand=lambda: 0.99)
-    m3 = msg("@Ngyydhd", sender="张三", t=clock.t, mentioned=True, msg_id="h1")
+    m3 = msg("@小助手", sender="张三", t=clock.t, mentioned=True, msg_id="h1")
     p3.decide(m3)
     p3.record_reply(m3, clock.t)
     late_img = msg("", sender="张三", t=clock.t + 200, msg_id="h2")
