@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """微信后端:接 wechatauto-replica。
 
 设计要点(都是实测踩过的坑):
@@ -195,6 +195,16 @@ class WxBackend(Backend):
     on_log       : 日志回调
     account      : 指定微信账号目录名(多账号机器上必须给,否则可能选错)
     """
+
+    #: 图片/语音的落盘根目录(None = 项目根)。
+    #  类属性,方便测试一次性覆盖到临时目录,免得在仓库里留一堆媒体文件。
+    media_cache_dir: Optional[str] = None
+
+    @classmethod
+    def _media_dir(cls, name: str) -> str:
+        base = cls.media_cache_dir or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..")
+        return os.path.join(base, name)
 
     def __init__(self, groups: List[str], poll_interval: float = 2.0,
                  on_log: Optional[Callable[[str], None]] = None,
@@ -565,8 +575,7 @@ class WxBackend(Backend):
         if local_id is None:
             return None
 
-        save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "..", "_images")
+        save_dir = self._media_dir("_images")
         try:
             os.makedirs(save_dir, exist_ok=True)
         except Exception:
@@ -713,8 +722,7 @@ class WxBackend(Backend):
         if not username or not msg_id:
             return None
 
-        save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "..", "_voices")
+        save_dir = self._media_dir("_voices")
         try:
             os.makedirs(save_dir, exist_ok=True)
         except Exception:
