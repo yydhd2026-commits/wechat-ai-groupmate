@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """规则引擎与端到端流程的离线测试。不需要微信、不需要 API Key。
 
 运行: python test_policy.py
@@ -1377,11 +1377,24 @@ def test_audit_regressions():
     check("内存缓存被裁到上限", len(tr._cache) == 3 and dropped == 7,
           "left=%s drop=%s" % (len(tr._cache), dropped))
 
-    # --- 7. 中文疑问句("吗/呢/吧")要认出来 ---
-    from groupmate.proactive import _looks_like_question
-    for t in ("明天上课吗", "这题你会做吧", "他来了没有呢", "你吃了吗"):
-        check("疑问句可识别: %s" % t, _looks_like_question(t))
+    # --- 7. 疑问句判定:分层门槛(强信号直接接,弱信号要更长) ---
+    from groupmate.proactive import _looks_like_question, _question_strength
+    # 强信号(问号 / 疑问词)
+    for t in ("这题怎么做啊", "有人知道食堂几点关门吗", "明天上课吗?", "为什么会这样"):
+        check("强疑问信号可识别: %s" % t, _looks_like_question(t, min_chars=6))
+    # 弱信号(只以"吗/呢/吧"结尾):短句不接,够长才接
+    check("弱信号短句不接(随口一说)", not _looks_like_question("我先去吃饭了吧",
+                                                        min_chars=6))
+    check("弱信号够长才接(真在问人)",
+          _looks_like_question("这周六到底要不要补课的吧", min_chars=6))
     check("陈述句不误判", not _looks_like_question("今天天气不错"))
+    # 强度分档本身
+    check("问号是强信号", _question_strength("你吃了吗？") == 2)
+    check("语气词结尾是弱信号", _question_strength("吃了吗") == 1)
+    check("陈述句无信号", _question_strength("我去吃饭了") == 0)
+    # 宽松模式(旧行为)仍然可用
+    check("宽松模式下弱信号短句也接",
+          _looks_like_question("明天上课吗", strict=False, min_chars=4))
 
 
 def test_gpt_audit_round2():
@@ -1526,6 +1539,77 @@ def test_gpt_audit_round2():
           str(len(p8._minute.stamps)))
 
 
+def test_proactive_throttle():
+    print("\n[27] 主动接话的频率闸门(冷却 + 每小时配额 + 门槛)")
+    import time as _t
+
+    # --- 默认配置本身就该是"安静"的 ---
+    d = BotConfig().trigger
+    check("默认主动冷却 >= 300 秒", d.proactive_cooldown_seconds >= 300,
+          str(d.proactive_cooldown_seconds))
+    check("默认有每小时配额上限", d.proactive_max_per_hour > 0,
+          str(d.proactive_max_per_hour))
+    check("默认要求明确提问", d.proactive_strict_question is True)
+
+    # --- 每小时配额真的会拦住 ---
+    cfg = base_cfg()
+    cfg.trigger.proactive_cooldown_seconds = 0     # 关掉冷却,单独验配额
+    cfg.trigger.proactive_max_per_hour = 2
+    cfg.trigger.proactive_min_chars = 4
+    cfg.trigger.proactive_strict_question = True
+    clock = FakeClock(at_hour(10))
+    p = ReplyPolicy(cfg, now_fn=clock, rand=lambda: 0.99)
+
+    fired = 0
+    # 连发 6 条"明确在提问"的消息,间隔 30 秒(一小时窗口内)
+    for i in range(6):
+        m = msg("这题怎么做啊", sender="张三", t=clock.t, msg_id="pq%d" % i)
+        dec = p.decide(m)
+        if dec.reply and dec.trigger == "proactive":
+            fired += 1
+            p.record_reply(m)
+        clock.advance(30)
+    check("每小时配额生效(一小时最多 2 次主动)",
+          fired == cfg.trigger.proactive_max_per_hour, "fired=%d" % fired)
+
+    # 过了一小时之后配额应该释放
+    clock.advance(3700)
+    m = msg("这题怎么做啊", sender="张三", t=clock.t, msg_id="pq_after")
+    dec = p.decide(m)
+    check("满一小时后配额释放,可以再主动一次",
+          dec.reply or "跟我不相关" in dec.reason, dec.reason)
+
+    # --- 冷却真的会拦住连珠炮 ---
+    cfg2 = base_cfg()
+    cfg2.trigger.proactive_cooldown_seconds = 600
+    cfg2.trigger.proactive_max_per_hour = 0        # 只验冷却
+    cfg2.trigger.proactive_min_chars = 4
+    clock2 = FakeClock(at_hour(10))
+    p2 = ReplyPolicy(cfg2, now_fn=clock2, rand=lambda: 0.99)
+    m1 = msg("这题怎么做啊", sender="张三", t=clock2.t, msg_id="pc1")
+    d1 = p2.decide(m1)
+    if d1.reply:
+        p2.record_reply(m1)
+    clock2.advance(60)                              # 才过 1 分钟
+    d2 = p2.decide(msg("这题怎么做啊", sender="李四", t=clock2.t, msg_id="pc2"))
+    check("默认冷却下,1 分钟后不会再主动接", not d2.reply, d2.reason)
+
+    # --- 门槛:随口一说不再被当成提问 ---
+    from groupmate.proactive import should_chime_in
+    for t in ("我先去吃饭了吧", "你吃了吗", "这题你会做吧"):
+        m = GroupMessage(group="测试群", sender="张三", content=t,
+                         timestamp=1000.0)
+        want, why, _r = should_chime_in(m, [], ["小助手"], 1000.0,
+                                        strict_question=True, min_chars=6)
+        check("随口一句不主动接: %s" % t, not want, why)
+    for t in ("这题怎么做啊", "有人知道食堂几点关门吗"):
+        m = GroupMessage(group="测试群", sender="张三", content=t,
+                         timestamp=1000.0)
+        want, _why, _r = should_chime_in(m, [], ["小助手"], 1000.0,
+                                         strict_question=True, min_chars=6)
+        check("真问题仍然会接: %s" % t, want)
+
+
 def test_memory():
     print("\n[17] 记忆系统(短期上下文 + 长期事实)")
     import os as _os
@@ -1636,6 +1720,7 @@ def main():
     test_bug_regressions()
     test_audit_regressions()
     test_gpt_audit_round2()
+    test_proactive_throttle()
     test_memory()
     print("\n" + "=" * 62)
     print("通过 %d 项,失败 %d 项" % (PASS, FAIL))

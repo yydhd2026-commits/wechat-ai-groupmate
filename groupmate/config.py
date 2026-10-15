@@ -52,8 +52,20 @@ class TriggerConfig:
     # ---------- 主动接话(不 @ 也读、也会判断该不该答) ----------
     # 开启后:没被 @ 的消息也会读进记忆,并且判断"这句可能需要我答"就自动接
     proactive_enabled: bool = True
-    # 两次"主动接话"之间至少隔多少秒(每群独立)
-    proactive_cooldown_seconds: float = 45.0
+    # 两次"主动接话"之间至少隔多少秒(每群独立)。
+    # ⚠ 这是控制"话多不多"最主要的旋钮。默认 300 秒(5 分钟),
+    #   想要更安静就调到 600~1800。
+    proactive_cooldown_seconds: float = 300.0
+    # 每个群每小时最多主动接几次 —— 冷却之外再加一道总量闸门。
+    # 只冷却不限量的话,群里聊得越热闹它插得越多。0 = 不限。
+    proactive_max_per_hour: int = 4
+    # "像在问问题"才主动接:至少这么长才算,太短的一律不接
+    proactive_min_chars: int = 6
+    # 只接「明确像在问问题」的消息:
+    #   True  = 必须有问号或疑问词(「怎么」「为什么」「有没有」…),
+    #           光有"吗/呢/吧"结尾不算 —— 那多半只是随口一说
+    #   False = 宽松模式,"明天上课吗"这类也算
+    proactive_strict_question: bool = True
 
 
 @dataclass

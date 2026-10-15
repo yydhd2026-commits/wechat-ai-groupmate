@@ -60,8 +60,39 @@ class ReplyPolicy:
         self._last_mention_who: dict = {}
         # 主动接话的冷却(每群最后一次主动开口的时间)
         self._last_proactive: dict = {}
+        # 每群最近的主动开口时间戳(deque),用于"每小时最多 N 次"的总量闸门
+        self._proactive_history: dict = {}
         self._proactive_reason = ""
         self._proactive_why = ""
+
+    # ---------- 主动接话的量控 ----------
+
+    def _proactive_over_hour_quota(self, group: str, now: float) -> bool:
+        """这一小时主动开口的次数是不是已经超了。
+
+        为什么冷却还不够:群里热闹时消息一条接一条,每次冷却刚过就又有
+        "像在问问题"的消息,结果还是显得话多。加一道总量闸门才真压得住。
+        """
+        quota = int(getattr(self.cfg.trigger, "proactive_max_per_hour", 0) or 0)
+        if quota <= 0:
+            return False
+        hist = self._proactive_history.get(group)
+        if not hist:
+            return False
+        # 清掉一小时前的
+        while hist and now - hist[0] > 3600.0:
+            hist.popleft()
+        return len(hist) >= quota
+
+    def _note_proactive(self, group: str, now: float) -> None:
+        """记一次主动开口(用于每小时配额)。"""
+        hist = self._proactive_history.get(group)
+        if hist is None:
+            hist = deque()
+            self._proactive_history[group] = hist
+        hist.append(now)
+        while hist and now - hist[0] > 3600.0:
+            hist.popleft()
 
     # ---------- 护栏 ----------
 
@@ -283,16 +314,26 @@ class ReplyPolicy:
         # 6b. 没被 @ 时:看要不要"主动接一句"。
         #     很多人不 @ 也会问问题、或者接着机器人的话往下说,
         #     这种该接的要接上,但必须有频率上限,不能变话痨。
-        #     ⚠ 两条豁免:
-        #       · @ 永远不受冷却限制(被点名必须答)
-        #       · 「在接我刚才说的话」也不受限制 —— 人家正跟你聊,你装死最像机器人
+        #     ⚠ 三道闸门一起管,只靠"冷却时间"是不够的 ——
+        #       群里聊得越热闹,消息到达越密,光冷却也拦不住它一直插嘴:
+        #         ① 冷却:两次主动接话之间至少隔 proactive_cooldown_seconds
+        #         ② 总量:每群每小时最多 proactive_max_per_hour 次
+        #         ③ 门槛:只接"明确像在问问题"的(见 proactive_strict_question)
+        #     两条豁免:
+        #       · @ 永远不受这些限制(被点名必须答)
+        #       · 「在接我刚才说的话」不受冷却限制 —— 人家正跟你聊,装死最像机器人
         if not triggered and t.proactive_enabled:
             last_p = self._last_proactive.get(msg.group)
             in_cool = (last_p is not None
                        and now - last_p < t.proactive_cooldown_seconds)
+            # 总量闸门:冷却之外再看"这一小时已经主动说过几次"
+            over_quota = self._proactive_over_hour_quota(msg.group, now)
             want, why, replying_to_me = should_chime_in(
-                msg, history or [], t.mention_names, now)
-            if want and (replying_to_me or not in_cool):
+                msg, history or [], t.mention_names, now,
+                strict_question=bool(getattr(
+                    t, "proactive_strict_question", True)),
+                min_chars=int(getattr(t, "proactive_min_chars", 6) or 6))
+            if want and (replying_to_me or (not in_cool and not over_quota)):
                 triggered, trigger = True, "proactive"
                 self._proactive_reason = why
                 self._proactive_why = why
@@ -355,6 +396,7 @@ class ReplyPolicy:
         # 主动接话单独计时(不走 _last_group_reply,否则 @ 之后的冷却会互相干扰)
         if self._proactive_reason:
             self._last_proactive[msg.group] = now
+            self._note_proactive(msg.group, now)   # 计入"每小时最多几次"
             self._proactive_reason = ""      # 用完即清,免得下次误记
         for b in (self._minute, self._hour, self._day):
             b.stamps.append(now)

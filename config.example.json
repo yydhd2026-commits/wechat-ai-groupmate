@@ -21,8 +21,14 @@
     "image_wait_seconds": 3,
     "image_follow_seconds": 90,
     "image_lookback_seconds": 600,
+
+    "_主动接话说明": "下面 5 项控制它'话多不多'。嫌吵就调大冷却、调小配额、把门槛调严,或直接 proactive_enabled=false。注意:@ 不受这些限制。",
     "proactive_enabled": true,
-    "proactive_cooldown_seconds": 20,
+    "proactive_cooldown_seconds": 300,
+    "proactive_max_per_hour": 4,
+    "proactive_min_chars": 6,
+    "proactive_strict_question": true,
+
     "post_send_cooldown_seconds": 8,
     "mention_debounce_seconds": 0,
     "self_silence_seconds": 1,

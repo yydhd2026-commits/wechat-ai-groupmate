@@ -86,24 +86,52 @@ def _at_someone_else(text: str, my_names: List[str]) -> bool:
     return False
 
 
-def _looks_like_question(text: str) -> bool:
+def _question_strength(text: str) -> int:
+    """这条消息"像在提问"的强度:0=不像, 1=弱(语气词), 2=强(明确提问)。
+
+    ⚠ 分成三档而不是布尔值,是因为"要不要接"取决于**问得多明确**:
+      · 强(问号/疑问词):「这题怎么做啊」—— 明显在求助,该接
+      · 弱(以"吗/呢/吧"结尾):「明天上课吗」—— 也可能是在问人,
+        所以不能一刀切不接,但要**再加一道长度门槛**才放行
+      · 无:「我先去吃饭了吧」—— 只是陈述+语气词,不接
+    """
+    t = (text or "").strip()
+    if not t:
+        return 0
+    if "?" in t or "？" in t:
+        return 2
+    if any(w in t for w in _QUESTION_WORDS):
+        return 2
+    tail = t.rstrip("。，、！~～… \t")
+    if tail.endswith(("吗", "呢", "吧", "么", "嘛")):
+        return 1
+    return 0
+
+
+def _looks_like_question(text: str, strict: bool = True,
+                         min_chars: int = 6) -> bool:
     """看着像在提问吗。
 
-    ⚠ 中文最常见的疑问句是"吗/呢/吧/么"结尾(「明天上课吗」「这题你会做吧」),
-    以前只用 _QUESTION_WORDS 找词,这些全漏判 -> 该接的没接。
-    现在把 _QUESTION_MARKS 用上(它本来就是为这个定义的,却一直没人引用)。
+    两层门槛 —— 因为"像问问题"太容易命中,群里随口一句就接会显得话多:
+
+      strict=True(默认,推荐):
+        · 强信号(问号 / 疑问词):过了 min_chars 就接
+        · 弱信号(仅以"吗/呢/吧"结尾):**要求更长**(min_chars + 4)才接,
+          因为这类句子很多只是随口一说,但「明天上课吗」这种确实是在问人
+
+      strict=False(宽松):
+        弱信号也直接按 min_chars 放行(旧行为)
     """
     t = (text or "").strip()
     if not t:
         return False
-    if "?" in t or "？" in t:
-        return True
-    if any(w in t for w in _QUESTION_WORDS):
-        return True
-    # 句尾疑问语气词(只看结尾两个字,避免"吗"出现在别处造成误判)
-    tail = t.rstrip("。，、！~～… \t")
-    if tail.endswith(("吗", "呢", "吧", "么", "嘛")):
-        return True
+    base = max(2, int(min_chars))
+    s = _question_strength(t)
+    if s == 2:
+        return len(t) >= base
+    if s == 1:
+        need = base if not strict else base + 4
+        return len(t) >= need
     return False
 
 
@@ -170,12 +198,17 @@ def _follows_mine(history, group: str, sender: str, now: float,
 
 
 def should_chime_in(msg, history, my_names: List[str],
-                    now: Optional[float] = None) -> Tuple[bool, str, bool]:
+                    now: Optional[float] = None,
+                    strict_question: bool = True,
+                    min_chars: int = 6) -> Tuple[bool, str, bool]:
     """规则级判断:这条没 @ 我的消息要不要主动接。
 
     返回 (要不要接, 原因, 是不是"在回应我")。
     第三项为真时调用方应绕过"主动接话冷却" —— 别人正接你的话,
     这时候必须回,否则就是装死。
+
+    strict_question / min_chars 用于控制"话多不多":
+    前者要求必须明确在提问,后者拦掉太短的消息。
     """
     # 语音消息的 content 是 "[语音]",真正的话在 voice_text —— 两个都要看
     raw = (msg.content or "").strip()
@@ -195,7 +228,8 @@ def should_chime_in(msg, history, my_names: List[str],
         return True, "在接我刚才的话", True
 
     # 像在问问题(而且没指定问谁)=> 可以接
-    if _looks_like_question(text) and len(text) >= 4:
+    if _looks_like_question(text, strict=strict_question,
+                            min_chars=min_chars):
         return True, "像在问问题", False
 
     return False, "跟我不相关", False
