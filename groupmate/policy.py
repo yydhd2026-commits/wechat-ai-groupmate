@@ -65,6 +65,52 @@ class ReplyPolicy:
 
     # ---------- 护栏 ----------
 
+    def export_state(self) -> dict:
+        """导出护栏状态,供重启后恢复。
+
+        ⚠ 为什么必须持久化:限流桶、连续失败计数、各种冷却全在内存里,
+        一重启就归零。如果机器人因为故障反复重启,每次都重新计时 ——
+        "每分钟 12 条"这类承诺就形同虚设,连续失败熔断也会被重置,
+        结果可能是重启后立刻又猛发一轮。
+        """
+        import time as _t
+        now = _t.time()
+        return {
+            "ts": now,
+            # 只留还在窗口内的计数,避免把过期数据也搬过去
+            "minute": [s for s in self._minute.stamps if now - s <= 60.0],
+            "hour": [s for s in self._hour.stamps if now - s <= 3600.0],
+            "day": [s for s in self._day.stamps if now - s <= 86400.0],
+            "failures": self._consecutive_failures,
+        }
+
+    def import_state(self, data: dict) -> None:
+        """恢复护栏状态。时间太久远的计数会被丢弃(自然过期)。"""
+        if not isinstance(data, dict):
+            return
+        import time as _t
+        now = _t.time()
+
+        def _take(key, window):
+            out = []
+            for s in (data.get(key) or []):
+                try:
+                    s = float(s)
+                except (TypeError, ValueError):
+                    continue
+                if 0 < now - s <= window:
+                    out.append(s)
+            return out
+
+        self._minute.stamps = deque(sorted(_take("minute", 60.0)))
+        self._hour.stamps = deque(sorted(_take("hour", 3600.0)))
+        self._day.stamps = deque(sorted(_take("day", 86400.0)))
+
+        try:
+            self._consecutive_failures = max(0, int(data.get("failures") or 0))
+        except (TypeError, ValueError):
+            self._consecutive_failures = 0
+
     def kill_switch_active(self) -> bool:
         p = self.cfg.guard.kill_switch_file
         return bool(p) and os.path.exists(p)
@@ -94,24 +140,37 @@ class ReplyPolicy:
     # ---------- 时间基准 ----------
 
     def _clock(self) -> float:
-        """单调时间游标:已见消息时间戳的高水位。
+        """单调时间游标:全局"已见时间戳"的高水位。
 
         只增不减,保证任何"现在 − 上次回复"的差值都不为负 ——
         这是"@ 必回"不被误杀的关键(机器人追赶积压时,消息时间戳会落后于
         真实时钟,若拿 time.time() 当基准,差值成负数会被判成"刚回过")。
-        不用 time.time():冷却只需要在"有新消息到达"时才有意义,
-        而新消息到达必然把游标往前推。
-        """
-        return max(self._seen_wall.values()) if self._seen_wall else 0.0
 
-    def note_wall(self, group: str, ts: float) -> None:
-        """记录某群的消息时间戳高水位(调用方在处理消息时喂进来)。"""
+        ⚠ 没有任何记录时退回真实时钟:否则游标会从 0 开始,
+        第一次冷却比较算出天文数字,判断完全失真。
+        """
+        if not self._seen_wall:
+            import time as _t
+            return _t.time()
+        return max(self._seen_wall.values())
+
+    def note_wall(self, group: str, ts: float) -> float:
+        """记录该群的时间戳高水位,返回**更新后的全局游标**。
+
+        ⚠ 两处容易写错的细节:
+          1. 用 >= 而不是 >:时间戳正好等于当前高水位时也要认,
+             否则"0 秒"这种合法时间戳会被整个丢掉(实测踩到,
+             导致冷却判定彻底失效)。
+          2. 返回全局值:_now() 取所有群的最大值,调用方要接着用它当基准,
+             不能只看本群那一格。
+        """
         try:
             ts = float(ts or 0)
         except (TypeError, ValueError):
-            return
-        if ts > self._seen_wall.get(group, 0.0):
+            return self._clock()
+        if ts >= self._seen_wall.get(group, float("-inf")):
             self._seen_wall[group] = ts
+        return self._clock()
 
     # ---------- 触发判定 ----------
 
@@ -180,8 +239,8 @@ class ReplyPolicy:
         # 喂高水位(单调,不回退),然后取统一的时间基准。
         # ⚠ now 必须包含本条消息的时间戳,否则"这条消息比上次回复晚多少"
         #   会被算成 0(游标还停在上一条),防抖/冷却会把该回的消息误杀。
-        self.note_wall(msg.group, wall)
-        now = max(self._now(), wall)
+        cursor = self.note_wall(msg.group, wall)
+        now = max(cursor, wall, self._now())
 
         # 1. 去重
         if msg.key in self.seen:
@@ -206,12 +265,20 @@ class ReplyPolicy:
                 msg.is_image_msg or msg.is_voice_msg):
             return Decision(False, "空消息")
 
-        # 5. 深夜静默(按挂钟小时 -> 用消息时间戳)
-        if len(t.quiet_hours) == 2 and is_quiet_hour(t.quiet_hours[0], t.quiet_hours[1], wall):
-            return Decision(False, "深夜静默时段")
-
-        # 6. 是否被触发
+        # 5+6. 深夜静默 与 触发判定
+        #
+        # ⚠ 顺序很关键:必须先判定"是不是 @ 我",再决定要不要静默。
+        #   老实现先查静默,于是**凌晨被 @ 也直接拒绝** —— 和 README/
+        #   配置注释承诺的"静默时段 @ 仍然会回"完全相反。
+        #   规则(代码 / 文档 / 测试三者一致):
+        #     · @ 我、以及它的图片/语音跟进 -> **穿透静默**,必回
+        #     · 关键词、主动接话 -> 静默时段不开口
         triggered, trigger = self._detect_trigger(msg)
+        force_triggers = ("mention", "image_follow", "voice_follow")
+        if trigger not in force_triggers:
+            if len(t.quiet_hours) == 2 and is_quiet_hour(
+                    t.quiet_hours[0], t.quiet_hours[1], wall):
+                return Decision(False, "深夜静默时段")
 
         # 6b. 没被 @ 时:看要不要"主动接一句"。
         #     很多人不 @ 也会问问题、或者接着机器人的话往下说,
@@ -269,12 +336,19 @@ class ReplyPolicy:
     # ---------- 记账 ----------
 
     def record_reply(self, msg: GroupMessage, now: Optional[float] = None) -> None:
-        # ⚠ 记账必须和 decide 用同一个时间基准,否则冷却差值会变成
-        #   "消息创建时刻 − 回复发出时刻",负数 => 后续消息被误判成"刚回过"。
-        #   显式传入的 now 优先(调用方/测试指定了基准就用它,不要自作主张)。
-        if now is None:
-            self.note_wall(msg.group, msg.timestamp or 0.0)
-            now = self._now()
+        """记账:记下"刚刚回了一条",供冷却/静默/限流使用。
+
+        ⚠ 记账的时间必须是**冷却判定时用的那个时间**(也就是单调游标),
+        不能听调用方随手传的值。踩过的坑:
+          · 传真实时钟 time.time() -> 与消息时间轴差几万秒,冷却全部失真;
+          · 传一个比游标还早的 msg.timestamp -> 冷却窗口被算成天文数字,
+            "刚回过就别再回"直接失效(实测:连续两条 @ 都回了)。
+        所以这里的规则是:以游标为准;调用方传的值只有在**更新**时才采纳。
+        """
+        cur = self.note_wall(msg.group, msg.timestamp or 0.0)
+        if now is not None and now > cur:
+            cur = self.note_wall(msg.group, now)
+        now = cur
         self._last_user_reply[msg.sender_id or msg.sender] = now
         self._last_group_reply[msg.group] = now
         self._last_self_msg[msg.group] = now

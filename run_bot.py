@@ -139,6 +139,14 @@ def cmd_demo() -> int:
     cfg.trigger.self_silence_seconds = 1
     cfg.trigger.proactive_cooldown_seconds = 3
     cfg.dry_run = True
+    # 演示不要污染项目目录:记忆写到临时文件里
+    demp_mem = os.path.join(__import__("tempfile").gettempdir(),
+                            "groupmate_demo_memory.json")
+    try:
+        if os.path.exists(demp_mem):
+            os.remove(demp_mem)
+    except OSError:
+        pass
 
     now = __import__("time").time()
     # 每条之间留足间隔,免得被"补发内容合并"逻辑合到一起,看不清单条行为
@@ -176,16 +184,10 @@ def cmd_demo() -> int:
             return "我是演示回复：你说的是「%s」对吧%s" % (
                 (msg.content or "")[:20], extra)
 
-    # 演示不要污染项目目录:记忆和运行状态都写到临时目录
-    import tempfile
-    demo_dir = tempfile.mkdtemp(prefix="groupmate_demo_")
     backend = MockBackend(script)
-    bot = GroupMateBot(cfg, backend, llm=EchoLLM(), data_dir=demo_dir)
+    bot = GroupMateBot(cfg, backend, llm=EchoLLM())
+    bot.memory.path = demp_mem            # 演示用临时记忆文件
     bot.run(poll_interval=0, max_loops=1)
-    try:
-        __import__("shutil").rmtree(demo_dir, ignore_errors=True)
-    except Exception:
-        pass
 
     print("\n" + "=" * 64)
     print("会发出的消息(演示是干跑模式,没有真的发):")

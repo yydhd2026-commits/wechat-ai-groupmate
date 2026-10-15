@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """微信后端:接 wechatauto-replica。
 
 设计要点(都是实测踩过的坑):
@@ -186,21 +186,6 @@ def detect_weixin_pids() -> List[int]:
 # ---------------------------------------------------------------- 后端实现
 
 class WxBackend(Backend):
-    """微信接入层。
-
-    media_cache_dir:图片/语音的落盘目录。默认是项目根的 `_images` / `_voices`。
-    测试应该指定一个临时目录,免得在仓库里留下一堆媒体文件。
-    """
-
-    #: 媒体缓存根目录(None = 项目根)。类属性,方便测试一次性覆盖。
-    media_cache_dir: Optional[str] = None
-
-    @classmethod
-    def _media_dir(cls, name: str) -> str:
-        base = cls.media_cache_dir or os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "..")
-        return os.path.join(base, name)
-
     """用 wechatauto-replica 收发群消息。
 
     参数
@@ -580,7 +565,8 @@ class WxBackend(Backend):
         if local_id is None:
             return None
 
-        save_dir = self._media_dir("_images")
+        save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "_images")
         try:
             os.makedirs(save_dir, exist_ok=True)
         except Exception:
@@ -727,7 +713,8 @@ class WxBackend(Backend):
         if not username or not msg_id:
             return None
 
-        save_dir = self._media_dir("_voices")
+        save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "_voices")
         try:
             os.makedirs(save_dir, exist_ok=True)
         except Exception:

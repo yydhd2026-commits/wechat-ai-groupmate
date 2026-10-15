@@ -65,6 +65,12 @@ class GroupMateBot:
         # 等待补发窗口里"顺手"取回来的消息。它们已被后端缓冲取走,
         # 必须留到下一轮处理,否则就是静默丢消息。
         self._deferred: List[GroupMessage] = []
+        # 被限流挡住的 @ —— 排队等配额恢复后补答。
+        # "被点名必答"是硬承诺,但限流是暂时的,所以是**延后**不是丢弃。
+        # 每项:[key, msg, 入队时间, 已试次数]
+        self._pending_mentions: list = []
+        self._mention_retry_window = 300.0   # 最多等 5 分钟
+        self._mention_retry_max = 10
         # 记忆提炼节流:每个群累计多少条新消息后提炼一次
         self._learn_every = int(getattr(cfg, "learn_every_messages", 25) or 25)
         self._since_learn: dict = {}
@@ -85,6 +91,12 @@ class GroupMateBot:
         ms = self.memory.stats()
         self.log("记忆已加载: %d 个群 / %d 条事实 / %d 条上下文"
                  % (ms["groups"], ms["facts"], ms["context_msgs"]))
+        # 恢复护栏状态(限流计数 / 连续失败)—— 不恢复的话,
+        # 机器人反复重启会每次都重新计时,"每分钟上限"就形同虚设。
+        try:
+            self._load_state()
+        except Exception as e:
+            self.log("恢复护栏状态失败(不影响运行): %r" % (e,))
         if not self.llm.ready:
             self.log("警告: 没有检测到 API Key(环境变量 %s),回复会失败。"
                      % self.cfg.llm.api_key_env)
@@ -271,6 +283,12 @@ class GroupMateBot:
         except Exception as e:
             self.log("语音补试出错(不影响别的): %r" % (e,))
 
+        # 后台补答之前被限流挡住的 @ —— "被点名必答"不能因为暂时超限就丢
+        try:
+            self._retry_pending_mentions()
+        except Exception as e:
+            self.log("待回复补答出错(不影响别的): %r" % (e,))
+
         # 定期清理媒体缓存目录(每来一条语音都会落盘 .silk + .wav,
         # 长期跑下去会把磁盘吃满)。每 200 轮清一次就够。
         self._ticks_done = getattr(self, "_ticks_done", 0) + 1
@@ -325,7 +343,13 @@ class GroupMateBot:
             # 只记一行,避免刷屏;被限流挡住的 @ 单独提醒
             brief = (msg.content or "").replace("\n", " ")[:20]
             if decision.forced:
-                self.log("⚠ @我 但被限流挡住: %s" % decision.reason)
+                # ⚠ @ 被限流挡住时**不能就这么丢了** ——
+                #   "被点名必答"是硬承诺,限流只是暂时的。
+                #   放进待回复队列,等配额恢复后补答(仍有次数/时限上限,
+                #   绝不会因为"必回"就突破安全护栏)。
+                self.log("⚠ @我 但被限流挡住,已排队等待配额恢复: %s"
+                         % decision.reason)
+                self._queue_mention(msg)
             else:
                 self.log("读取 [%s] %s" % (msg.group, brief))
             return None
@@ -400,9 +424,161 @@ class GroupMateBot:
         if mem:
             sys_prompt += "\n\n" + mem
 
-        # 生成回复
+        # 生成回复(走统一的方法:护栏检查与记账只写一次)
+        text = self._generate_reply(msg, trigger=decision.trigger,
+                                    images=images, extra_context=ctx)
+        if text is None:
+            return None
+        # ⚠ 这里传 msg.timestamp(消息时间轴),不要传 time.time():
+        #   发送冷却(_recent_sent_ts)是按消息时间戳比较的,混入真实时钟
+        #   会让差值变成负数,冷却整个失效(实测踩到)。
+        if self._send_and_record(msg, text, decision.trigger,
+                                 msg.timestamp or time.time()):
+            return text
+        return None
+
+
+    # ---------- 统一的发送出口 ----------
+
+    def _send_and_record(self, msg: GroupMessage, text: str, trigger: str,
+                         now: Optional[float] = None) -> bool:
+        """**所有**对外发送都必须走这里。
+
+        为什么要收口:以前有 4 条各自发送的路径(普通回复 / 干跑 /
+        语音补答 / 语音听不了提示),每条的护栏检查和记账都不一样 ——
+        结果语音提示那条既没过限流、也没计入配额(实测查出来的 bug)。
+        统一到一个出口后,"发之前查护栏、发之后记账"只写一次,不会再漏。
+
+        返回 True 表示确实发出去了(干跑视为已发)。
+        """
+        if not text:
+            return False
+        now = now if now is not None else time.time()
+
+        # ---- 干跑:只打印,不发送,但仍记账(便于观察配额消耗)----
+        if self.cfg.dry_run:
+            self.log("[干跑] 本想发到「%s」: %s" % (msg.group, text))
+            self.outbox.append((msg.group, text, "dry_run"))
+            self._note_sent(msg.group, text, msg.timestamp)
+            self.policy.record_reply(msg)
+            self.stats["replied"] += 1
+            return True
+
+        # ---- 发送前统一过护栏:限流 / 熔断 / 紧急停止 ----
+        ok_guard, why = self.policy.guard_check(now)
+        if not ok_guard:
+            self.log("发送被护栏挡住(稍后再试): %s" % why)
+            return False
+
         try:
-            raw = self.llm.reply(msg, ctx, sys_prompt, images=images or None,
+            sent = self.backend.send(msg.group, text)
+        except Exception as e:
+            sent = False
+            self.log("发送异常: %r" % (e,))
+
+        if not sent:
+            self.policy.record_failure()
+            self.stats["failed"] += 1
+            self.log("发送失败(第 %d 次连续失败)"
+                     % self.policy.consecutive_failures)
+            return False
+
+        # ---- 发送成功:统一记账 ----
+        # ⚠ _note_sent 用真实时钟(供回声拦截),这里不能改;
+        #   但**记进上下文的对象必须用消息时间轴** —— 否则自己的发言会带着
+        #   真实时钟进 history,和别人的消息时间戳相差极大,
+        #   proactive._follows_mine 会算出"我上一句是一百多天前说的",
+        #   "对方接着我的话往下说"这个判断就永远不成立(实测踩到)。
+        self._note_sent(msg.group, text, msg.timestamp)
+        self.policy.record_reply(msg, now)
+        self.stats["replied"] += 1
+        self.outbox.append((msg.group, text, trigger))
+        try:
+            self._remember(GroupMessage(
+                group=msg.group, sender="我", content=text,
+                timestamp=msg.timestamp or now, is_self=True,
+                sender_id=self._self_id(),
+                msg_id="self_%s" % (msg.msg_id or int(now * 1000))))
+        except Exception as e:
+            self.log("记录自己的发言失败(不影响发送): %r" % (e,))
+        extra = ""
+        if trigger == "proactive":
+            why2 = getattr(self.policy, "_proactive_why", "") or "判断该接"
+            extra = "（主动接:%s）" % why2
+            self.policy._proactive_why = ""
+        self.log("[已发送] 「%s」(%s触发)%s: %s"
+                 % (msg.group, trigger, extra, text))
+        self._save_state()
+        return True
+
+    # ---------- 待回复队列(被限流挡住的 @)----------
+
+    def _queue_mention(self, msg: GroupMessage) -> None:
+        """把被限流挡住的 @ 排队,等配额恢复后补答。
+
+        注意:只是**延后**,不是**绕过**。补答时仍要过 guard_check,
+        所以次数/时限上限一样管着它,绝不会因为"必回"就突破安全护栏。
+        """
+        key = msg.key
+        if any(k == key for k, _m, _t, _n in self._pending_mentions):
+            return
+        if len(self._pending_mentions) >= 20:      # 硬上限,防止堆积
+            self.log("待回复队列已满(20),丢弃最旧的一条")
+            self._pending_mentions.pop(0)
+        self._pending_mentions.append([key, msg, time.time(), 0])
+        self.log("待回复队列 +1(当前 %d 条)" % len(self._pending_mentions))
+
+    def _retry_pending_mentions(self) -> None:
+        """每轮 tick 试一次:配额恢复了就把欠下的 @ 补上。"""
+        if not self._pending_mentions:
+            return
+        now = time.time()
+        done = []
+        for item in list(self._pending_mentions):
+            key, msg, first_try, tries = item
+            if now - first_try > self._mention_retry_window \
+                    or tries >= self._mention_retry_max:
+                self.log("待回复放弃(超时/试满): %s"
+                         % (msg.content or "")[:24])
+                done.append(item)
+                continue
+            ok_guard, _why = self.policy.guard_check(now)
+            if not ok_guard:
+                item[3] = tries + 1
+                continue                          # 配额还没恢复,下轮再试
+
+            item[3] = tries + 1
+            text = self._generate_reply(msg, trigger="mention")
+            if text is None:
+                continue                          # 生成失败,留给下轮
+            if self._send_and_record(msg, text, "mention", now):
+                self.log("欠下的 @ 已补答: %s" % text[:40])
+                done.append(item)
+
+        for item in done:
+            try:
+                self._pending_mentions.remove(item)
+            except ValueError:
+                pass
+
+    # ---------- 生成回复(供各条路径复用)----------
+
+    def _generate_reply(self, msg: GroupMessage, trigger: str = "",
+                        images: Optional[List[str]] = None,
+                        extra_context: str = "") -> Optional[str]:
+        """问模型要一段回复文本。失败返回 None(由调用方决定是否重试)。"""
+        ctx = extra_context or self._group_context(msg.group)
+        sys_prompt = self.cfg.persona.build_system_prompt()
+        try:
+            mem = self.memory.memory_text(msg.group, query=msg.content or "",
+                                          about=msg.sender)
+            if mem:
+                sys_prompt += "\n\n" + mem
+        except Exception:
+            pass
+        try:
+            raw = self.llm.reply(msg, ctx, sys_prompt,
+                                 images=images or None,
                                  mention_names=self.cfg.trigger.mention_names)
         except LLMError as e:
             self.policy.record_failure()
@@ -424,60 +600,11 @@ class GroupMateBot:
             self.stats["failed"] += 1
             self.log("模型返回空内容,跳过。")
             return None
-
         if self.cfg.trigger.reply_prefix:
             text = self.cfg.trigger.reply_prefix + text
-
-        # 干跑:只打印,不发送
-        if self.cfg.dry_run:
-            self.log("[干跑] 本想发到「%s」: %s" % (msg.group, text))
-            self.outbox.append((msg.group, text, "dry_run"))
-            self._note_sent(msg.group, text, msg.timestamp)
-            self.policy.record_reply(msg)
-            self.stats["replied"] += 1
-            return text
-
-        # 真发
-        try:
-            ok = self.backend.send(msg.group, text)
-        except Exception as e:
-            ok = False
-            self.log("发送异常: %r" % (e,))
-
-        if ok:
-            # 先记下来:自己的消息马上会被读回来,必须能认出来
-            self._note_sent(msg.group, text, msg.timestamp)
-            self.policy.record_reply(msg)
-            self.stats["replied"] += 1
-            self.outbox.append((msg.group, text, decision.trigger))
-            # 把自己的回复也放进上下文 —— 否则"对方接着我的话往下说"
-            # 这个判断根本找不到"我的话",主动性就废了。
-            try:
-                mine = GroupMessage(
-                    group=msg.group, sender="我", content=text,
-                    timestamp=time.time(), msg_id="self_%d" % int(time.time() * 1000),
-                    is_self=True, sender_id=self._self_id())
-                self._remember(mine)
-            except Exception as e:
-                self.log("记录自己的发言失败(不影响发送): %r" % (e,))
-            extra = ""
-            if decision.trigger == "proactive":
-                why = getattr(self.policy, "_proactive_why", "") or "判断该接"
-                extra = "（主动接:%s）" % why
-                self.policy._proactive_why = ""
-            self.log("[已发送] 「%s」(%s触发)%s: %s"
-                     % (msg.group, decision.trigger, extra, text))
-            self._save_state()
-            return text
-
-        self.policy.record_failure()
-        self.stats["failed"] += 1
-        self.log("发送失败(第 %d 次连续失败)" % self.policy.consecutive_failures)
-        return None
+        return text
 
     # ---------- 图片收集 ----------
-
-    # ---------- 语音识别 ----------
 
     def _transcriber(self):
         """惰性创建语音识别器(只建一次)。"""
@@ -638,12 +765,8 @@ class GroupMateBot:
         if not text.strip():
             return True                      # 没内容可答,终态
 
-        # ⚠ 补答必须过护栏:否则会绕过限流/熔断,变成无限刷屏
-        ok, why = self.policy.guard_check(time.time())
-        if not ok:
-            self.log("语音补答被护栏挡住(稍后再试): %s" % why)
-            return False
-
+        # 注意:护栏检查与记账都在 _send_and_record 里,这里不再重复做 ——
+        # 重复检查会让配额被扣两次,行为也对不上。
         ctx = self._group_context(msg.group)
         sys_prompt = self.cfg.persona.build_system_prompt()
         mem = self.memory.memory_text(msg.group, query=text, about=msg.sender)
@@ -665,29 +788,11 @@ class GroupMateBot:
         out = sanitize_reply(raw, self.cfg.trigger.max_reply_chars)
         if not out:
             return True                      # 模型没给出内容 = 终态,别死循环
-        try:
-            sent = self.backend.send(msg.group, out)
-        except Exception as e:
-            sent = False
-            self.log("语音补答发送异常: %r" % (e,))
-
+        # ⚠ 走统一出口(内部会过护栏 + 记账 + 记上下文)
+        sent = self._send_and_record(msg, out, "voice_follow")
         if sent:
-            self._note_sent(msg.group, out, time.time())
-            # 计入限流桶 —— 不记账的话护栏永远拦不住
-            self.policy.record_reply(virtual, time.time())
-            self.stats["replied"] += 1
-            self.outbox.append((msg.group, out, "voice_follow"))
-            # ⚠ 自己的回复必须进上下文:否则模型下一次看不到自己刚说过什么,
-            #   而且 proactive._follows_mine 找不到"我最后说的话",
-            #   用户紧接着的"那为啥…"不会被认成接我的话。
-            self._remember(GroupMessage(
-                group=msg.group, sender="我", content=out,
-                timestamp=time.time(), msg_id="self_voice_%s" % msg.msg_id,
-                is_self=True))
             self.log("[已发送] 「%s」(语音补答): %s" % (msg.group, out))
             return True
-
-        self.policy.record_failure()
         self.log("语音补答发送失败(稍后再试)")
         return False
 
@@ -713,8 +818,9 @@ class GroupMateBot:
             why = ("没配语音识别 Key" if not self._transcriber().ready
                    else "这段语音的音频没能取到")
             note = "语音没听清(%s),打字说呗[捂脸]" % why
-            if self.backend.send(msg.group, note):
-                self._note_sent(msg.group, note, time.time())
+            # ⚠ 必须走统一出口:以前这里直接调 backend.send,
+            #   既没过限流,也没计入配额 —— 绕过了护栏(实测查出来的)。
+            if self._send_and_record(msg, note, "voice_notice"):
                 self.log("[已发送] 语音听不了,告知群友: %s" % note)
         except Exception as e:
             self.log("语音提示发送失败(不影响别的): %r" % (e,))
@@ -813,6 +919,26 @@ class GroupMateBot:
                                 self.log("已下载 %d 张图片" % n)
                         except Exception as e:
                             self.log("图片下载出错: %r" % (e,))
+                # ⚠ 等待窗口收到的语音也要走识别流程。
+                #   主循环有 ensure_voices + _transcribe,这条分支以前只处理了图片,
+                #   于是"先 @ 再发语音条"时语音虽然有对象、voice_path/voice_text 却是空的,
+                #   机器人等于没听懂。这里补上,两条路径行为一致。
+                if any(getattr(m, "is_voice_msg", False) for m in extra):
+                    fn = getattr(self.backend, "ensure_voices", None)
+                    if callable(fn):
+                        try:
+                            n = fn(extra)
+                            if n:
+                                self.log("已提取 %d 段语音" % n)
+                        except Exception as e:
+                            self.log("语音提取出错: %r" % (e,))
+                    for m in extra:
+                        if getattr(m, "is_voice_msg", False) and m.voice_path \
+                                and not m.voice_text:
+                            try:
+                                self._transcribe(m)
+                            except Exception as e:
+                                self.log("语音识别出错: %r" % (e,))
         consumed.extend(candidates)
 
         # ---------- 3. 组装 ----------
@@ -914,9 +1040,37 @@ class GroupMateBot:
     # ---------- 状态 ----------
 
     def _save_state(self) -> None:
+        """把统计 + **护栏状态**一起落盘。
+
+        ⚠ 护栏状态必须存:限流桶、连续失败计数只在内存里,
+        重启就归零 —— 故障反复重启时"每分钟上限"会失效,熔断也被重置。
+        """
         try:
-            with open(self._state_file, "w", encoding="utf-8") as f:
-                json.dump({"stats": self.stats, "ts": time.time()}, f,
-                          ensure_ascii=False, indent=2)
+            payload = {"stats": self.stats, "ts": time.time()}
+            try:
+                payload["guard"] = self.policy.export_state()
+            except Exception:
+                pass
+            tmp = self._state_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self._state_file)
         except Exception:
             pass
+
+    def _load_state(self) -> None:
+        """恢复上次落盘的护栏状态。"""
+        if not os.path.exists(self._state_file):
+            return
+        with open(self._state_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        guard = (data or {}).get("guard")
+        if isinstance(guard, dict):
+            self.policy.import_state(guard)
+            fd = now = None
+            try:
+                n = len(self.policy._minute.stamps)
+                self.log("护栏状态已恢复: 近1分钟已发 %d 次, 连续失败 %d 次"
+                         % (n, self.policy.consecutive_failures))
+            except Exception:
+                pass

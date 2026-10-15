@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """规则引擎与端到端流程的离线测试。不需要微信、不需要 API Key。
 
 运行: python test_policy.py
@@ -14,13 +14,14 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="repla
 # ---------------------------------------------------------------------------
 # 测试的落盘隔离
 #
-# ⚠ 这个沙箱环境下 tempfile.gettempdir() 会指向**当前工作目录**,
-#   所以裸用 tempfile.mkdtemp() 会把临时目录直接建在仓库里 ——
-#   跑一次测试就多出一堆 tmpXXXXXXXX/ 目录。
-#   下面统一包装一次:所有由本文件创建的临时目录都会登记,退出时自动清理。
+# ⚠ 某些受限环境里 tempfile.gettempdir() 会指向**当前工作目录**,
+#   于是裸用 tempfile.mkdtemp() 会把临时目录直接建在仓库里 ——
+#   跑一次测试就多出一堆 tmpXXXXXXXX/ 目录,还可能被误提交。
+#   下面统一包装一次:登记所有临时目录,退出时清理;
+#   并在收尾时兜底清扫工作目录(有些测试的临时目录调用点分散,
+#   只登记"本文件创建的"难免漏网)。
 #
-#   而且必须**在 import groupmate 之前**装好,这样 groupmate 内部的
-#   落盘行为(如果有)也会被隔离。
+#   必须在 import groupmate 之前装好。
 # ---------------------------------------------------------------------------
 import atexit as _atexit
 import shutil as _shutil
@@ -28,6 +29,8 @@ import tempfile as _tempfile
 
 _TMP_DIRS: list = []
 _real_mkdtemp = _tempfile.mkdtemp
+# atexit 里 __file__ 可能不可用,先把路径记下来
+_HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def _tracked_mkdtemp(*a, **kw):
@@ -44,6 +47,17 @@ def _cleanup_tmp():
     for d in reversed(_TMP_DIRS):
         _shutil.rmtree(d, ignore_errors=True)
     _TMP_DIRS.clear()
+    # 兜底:清扫工作目录里遗留的临时目录和媒体缓存
+    _here = _HERE
+    try:
+        for name in os.listdir(_here):
+            p = os.path.join(_here, name)
+            if name.startswith("tmp") and os.path.isdir(p):
+                _shutil.rmtree(p, ignore_errors=True)
+            elif name in ("_images", "_voices") and os.path.isdir(p):
+                _shutil.rmtree(p, ignore_errors=True)
+    except Exception:
+        pass
 
 
 _atexit.register(_cleanup_tmp)
@@ -55,19 +69,23 @@ from groupmate.llm import sanitize_reply
 from groupmate.message import GroupMessage, is_quiet_hour, strip_mention
 from groupmate.policy import ReplyPolicy
 
-# 测试专用的落盘目录(记忆/状态),同样隔离到临时目录
-_TEST_DATA_DIR = _tracked_mkdtemp(prefix="groupmate_test_")
+# 媒体缓存(图片/语音)默认落在仓库根的 _images / _voices —— 测试要隔离掉
+try:
+    from groupmate.wx_backend import WxBackend as _WxBackend
+    _WxBackend.media_cache_dir = _TMP_DIRS[0] if _TMP_DIRS else _tempfile.mkdtemp()
+    _TMP_DIRS.append(_WxBackend.media_cache_dir)
+except Exception:
+    pass
 
-# 媒体缓存(图片/语音)也要隔离:默认会落在仓库根的 _images / _voices,
-# 跑测试就多两个目录。这里直接把后端类属性指到临时目录。
-from groupmate.wx_backend import WxBackend as _WxBackend
-_WxBackend.media_cache_dir = _TEST_DATA_DIR
+# 测试用的落盘目录(记忆/状态)
+_TEST_DATA_DIR = _tempfile.mkdtemp(prefix="groupmate_test_")
+_TMP_DIRS.append(_TEST_DATA_DIR)
 
 _OrigBot = GroupMateBot
 
 
 class GroupMateBot(_OrigBot):                # noqa: F811
-    """测试专用:默认把落盘目录指到临时目录。"""
+    """测试专用:默认把落盘目录指到临时目录,不污染仓库。"""
 
     def __init__(self, cfg, backend, llm=None, logger=None, data_dir=None):
         super().__init__(cfg, backend, llm=llm, logger=logger,
@@ -165,8 +183,20 @@ def test_policy():
     print("\n[2] 深夜静默")
     p6 = ReplyPolicy(base_cfg(), now_fn=clock, rand=lambda: 0.99)
     night = at_hour(2)
+    # 静默时段 @ 我 -> **必须回**(被点名优先级最高,和 README/配置注释一致)
     d = p6.decide(msg("@小助手 在吗", t=night, mentioned=True))
-    check("凌晨2点 -> 不回", not d.reply and "静默" in d.reason, d.reason)
+    check("凌晨2点被 @ -> 仍然要回", d.reply and d.trigger == "mention",
+          "%s / %s" % (d.reply, d.reason))
+    # 静默时段关键词 -> 不回
+    p6b = ReplyPolicy(base_cfg(), now_fn=clock, rand=lambda: 0.99)
+    d2 = p6b.decide(msg("今天天气怎么样", t=night, sender="李四"))
+    check("凌晨2点关键词 -> 不回", not d2.reply and "静默" in d2.reason,
+          d2.reason)
+    # 静默时段主动接话 -> 不回
+    p6c = ReplyPolicy(base_cfg(), now_fn=clock, rand=lambda: 0.99)
+    d3 = p6c.decide(msg("有人知道食堂几点关门吗", t=night, sender="王五"))
+    check("凌晨2点主动接话 -> 不回", not d3.reply and "静默" in d3.reason,
+          d3.reason)
     check("跨零点判定正确(23-7)",
           is_quiet_hour(23, 7, at_hour(2)) and is_quiet_hour(23, 7, at_hour(23))
           and not is_quiet_hour(23, 7, at_hour(10)))
@@ -1354,6 +1384,148 @@ def test_audit_regressions():
     check("陈述句不误判", not _looks_like_question("今天天气不错"))
 
 
+def test_gpt_audit_round2():
+    print("\n[26] 第二轮审计回归(静默/@ 必回/护栏一致性/语音路径)")
+    import os as _os
+    import shutil
+    import tempfile
+    import time as _t
+
+    clock = FakeClock(at_hour(2))          # 凌晨 —— 静默时段
+    cfg = base_cfg()
+    cfg.mention_debounce_seconds = 0
+
+    # --- 1. 静默时段 @ 我 必须回(以前被静默挡掉,和文档矛盾)---
+    p = ReplyPolicy(cfg, now_fn=clock, rand=lambda: 0.99)
+    d = p.decide(msg("@小助手 睡了吗", t=clock.t, mentioned=True))
+    check("静默时段被 @ -> 必回",
+          d.reply and d.trigger == "mention", "%s / %s" % (d.reply, d.reason))
+
+    # 语音形式的 @ 也要穿透静默
+    p2 = ReplyPolicy(cfg, now_fn=clock, rand=lambda: 0.99)
+    vm = msg("", t=clock.t, msg_id="nv1")
+    vm.msg_type = "语音"
+    vm.voice_text = "@小助手 睡了吗"
+    d2 = p2.decide(vm)
+    check("静默时段语音里的 @ -> 必回",
+          d2.reply and d2.trigger == "mention", "%s / %s" % (d2.reply, d2.reason))
+
+    # 静默时段非 @ 仍然不回
+    p3 = ReplyPolicy(cfg, now_fn=clock, rand=lambda: 0.99)
+    d3 = p3.decide(msg("今天天气怎么样", t=clock.t, sender="李四"))
+    check("静默时段关键词 -> 不回", not d3.reply, d3.reason)
+
+    # --- 2. 被限流挡住的 @ 要排队,配额恢复后补答 ---
+    cfg4 = base_cfg()
+    cfg4.dry_run = False
+    cfg4.trigger.image_wait_seconds = 0.0
+    cfg4.trigger.mention_debounce_seconds = 0   # 线上就是 0,避免防抖先挡住
+    cfg4.guard.max_per_minute = 1          # 只允许一条
+    be4 = MockBackend()
+    llm4 = StubLLM(["第一条", "补答的那条"])
+    bot4 = GroupMateBot(cfg4, be4, llm=llm4, logger=lambda m: None)
+    bot4.policy._now = FakeClock(at_hour(10))
+    bot4.policy._now_fn = None             # 用真实游标逻辑
+    bot4.policy._now = bot4.policy._clock
+
+    t0 = _t.time()
+    be4.feed(msg("@小助手 第一问", sender="张三", t=t0, mentioned=True,
+                 msg_id="mq1"))
+    bot4.tick()
+    check("第一条 @ 正常回复", bot4.stats["replied"] == 1, str(bot4.stats))
+
+    be4.feed(msg("@小助手 第二问", sender="李四", t=t0 + 1, mentioned=True,
+                 msg_id="mq2"))
+    bot4.tick()
+    check("被限流的 @ 进入待回复队列(没有被丢掉)",
+          len(bot4._pending_mentions) == 1, str(len(bot4._pending_mentions)))
+
+    # 配额恢复(把上限放开)-> 补答
+    bot4.cfg.guard.max_per_minute = 10
+    bot4._retry_pending_mentions()
+    check("配额恢复后欠下的 @ 被补答",
+          bot4.stats["replied"] == 2 and not bot4._pending_mentions,
+          str(bot4.stats) + " pending=" + str(len(bot4._pending_mentions)))
+
+    # --- 3. 语音提示也要过护栏(以前直接 send,绕过限流)---
+    cfg5 = base_cfg()
+    cfg5.dry_run = False
+    cfg5.voice.enabled = True
+    cfg5.voice.tell_when_unavailable = True
+    cfg5.guard.max_per_minute = 0          # 限流设 0 -> 一切发送都该被挡
+    be5 = MockBackend()
+    bot5 = GroupMateBot(cfg5, be5, llm=StubLLM(["x"]), logger=lambda m: None)
+    vmsg = msg("", sender="张三", t=_t.time(), msg_id="tv1")
+    vmsg.msg_type = "语音"
+    bot5._tell_voice_unavailable(vmsg, 3)
+    check("语音听不了提示被限流挡住时不发送", len(be5.sent) == 0, str(be5.sent))
+
+    # --- 4. 等待补发窗口收到的语音要走识别流程 ---
+    cfg6 = base_cfg()
+    cfg6.dry_run = False
+    cfg6.trigger.image_wait_seconds = 0.4
+    cfg6.trigger.mention_debounce_seconds = 0
+    be6 = MockBackend()
+    bot6 = GroupMateBot(cfg6, be6, llm=StubLLM(["好"]), logger=lambda m: None)
+    calls = {"n": 0}
+
+    class VoiceAwareBackend(MockBackend):
+        def ensure_voices(self, messages=None):
+            n = 0
+            for m in (messages or []):
+                if getattr(m, "is_voice_msg", False) and not m.voice_path:
+                    m.voice_path = "/tmp/fake.silk"
+                    n += 1
+            calls["n"] += n
+            return n
+
+        def poll(self):
+            out = super().poll()
+            for m in out:
+                m.voice_path = ""          # 模拟"音频还没下载好"
+            return out
+
+    be7 = VoiceAwareBackend()
+    bot7 = GroupMateBot(cfg6, be7, llm=StubLLM(["好"]), logger=lambda m: None)
+    bot7._transcribe = lambda m: (setattr(m, "voice_text", "识别出来的"),
+                                  "识别出来的")[1]
+    # 先 @ 建立触发,再在同一次 tick 的中途补一条语音
+    be7.feed(msg("@小助手 在吗", sender="张三", t=_t.time() - 100,
+                 mentioned=True, msg_id="vw1"))
+    vmsg2 = msg("", sender="张三", t=_t.time() - 99, msg_id="vw2")
+    vmsg2.msg_type = "语音"
+    be7.feed(vmsg2)
+    bot7.tick()
+    check("等待窗口里的语音也被提取并识别(不再被漏掉)",
+          calls["n"] >= 1 or any(getattr(m, "voice_text", "")
+                                 for m in bot7.history),
+          "ensure_voices=%d" % calls["n"])
+
+    # --- 5. 护栏状态要能持久化(重启不重置)---
+    from groupmate.policy import ReplyPolicy as RP
+    p6 = RP(base_cfg(), rand=lambda: 0.99)
+    p6.record_reply(msg("x", t=_t.time()), _t.time())
+    p6.record_failure()
+    p6.record_failure()
+    snap = p6.export_state()
+    check("导出的护栏状态含限流计数与失败数",
+          snap.get("minute") and snap.get("failures") == 2, str(snap))
+
+    p7 = RP(base_cfg(), rand=lambda: 0.99)
+    p7.import_state(snap)
+    check("重启后恢复限流计数", len(p7._minute.stamps) == len(snap["minute"]),
+          str(len(p7._minute.stamps)))
+    check("重启后恢复连续失败数", p7.consecutive_failures == 2,
+          str(p7.consecutive_failures))
+    # 过期的计数要被丢掉
+    p8 = RP(base_cfg(), rand=lambda: 0.99)
+    old = _t.time() - 99999
+    p8.import_state({"minute": [old], "hour": [old], "day": [old],
+                     "failures": 0})
+    check("过期计数恢复时被丢弃", len(p8._minute.stamps) == 0,
+          str(len(p8._minute.stamps)))
+
+
 def test_memory():
     print("\n[17] 记忆系统(短期上下文 + 长期事实)")
     import os as _os
@@ -1463,6 +1635,7 @@ def main():
     test_voice_retry_queue()
     test_bug_regressions()
     test_audit_regressions()
+    test_gpt_audit_round2()
     test_memory()
     print("\n" + "=" * 62)
     print("通过 %d 项,失败 %d 项" % (PASS, FAIL))
